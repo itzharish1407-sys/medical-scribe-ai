@@ -1,5 +1,5 @@
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import {
   Activity, AudioLines, Bell, CalendarDays, Check,
   ChevronDown, ClipboardList, Clock3, FileText,
@@ -28,6 +28,12 @@ export default function App() {
   const [showPatientForm, setShowPatientForm] = useState(false)
   const [patientName, setPatientName] = useState('')
   const [patientReason, setPatientReason] = useState('')
+  const mediaRecorderRef = useRef(null)
+  const streamRef = useRef(null)
+  const audioChunksRef = useRef([])
+  const audioUrlRef = useRef(null)
+  const [audioUrl, setAudioUrl] = useState('')
+  const [recordingError, setRecordingError] = useState('')
   const patients = patientList.filter(patient =>
   `${patient.name} ${patient.id} ${patient.reason}`
     .toLowerCase()
@@ -35,20 +41,99 @@ export default function App() {
 )
 
 
-  function startRecording() {
-    setRecording(true)
-    setPaused(false)
-    setFinished(false)
-    setApproved(false)
-    setTranscript('')
-    setNotes('')
+  async function startRecording() {
+    try {
+      setRecordingError('')
+
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+        setRecordingError('Audio recording is not supported in this browser. Try a recent version of Chrome or Firefox.')
+        return
+      }
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current)
+        audioUrlRef.current = null
+      }
+
+      setAudioUrl('')
+      setTranscript('')
+      setNotes('')
+      setApproved(false)
+      setFinished(false)
+      setPaused(false)
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      audioChunksRef.current = []
+
+      const recorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) audioChunksRef.current.push(event.data)
+      }
+
+      recorder.onstop = () => {
+        const blob = new Blob(audioChunksRef.current, {
+          type: recorder.mimeType || 'audio/webm',
+        })
+        if (blob.size > 0) {
+          const url = URL.createObjectURL(blob)
+          audioUrlRef.current = url
+          setAudioUrl(url)
+        }
+        stream.getTracks().forEach(track => track.stop())
+        if (streamRef.current === stream) streamRef.current = null
+      }
+
+      recorder.start()
+      setRecording(true)
+    } catch (error) {
+      streamRef.current?.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+      mediaRecorderRef.current = null
+      setRecording(false)
+      setPaused(false)
+      setRecordingError(
+        error?.name === 'NotAllowedError'
+          ? 'Microphone permission was denied. Allow microphone access in your browser and try again.'
+          : `Could not start recording: ${error?.message || 'Unknown error'}`
+      )
+    }
+  }
+
+  function togglePause() {
+    const recorder = mediaRecorderRef.current
+    if (!recorder) return
+    if (recorder.state === 'recording') {
+      recorder.pause()
+      setPaused(true)
+    } else if (recorder.state === 'paused') {
+      recorder.resume()
+      setPaused(false)
+    }
   }
 
   function finishRecording() {
+    const recorder = mediaRecorderRef.current
+    if (!recorder) return
+    if (recorder.state !== 'inactive') recorder.stop()
     setRecording(false)
     setPaused(false)
     setFinished(true)
   }
+
+  useEffect(() => {
+    return () => {
+      const recorder = mediaRecorderRef.current
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.onstop = null
+        recorder.stop()
+      }
+      streamRef.current?.getTracks().forEach(track => track.stop())
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
+    }
+  }, [])
 
   function addPatient(event) {
     event.preventDefault()
@@ -76,7 +161,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Activity size={23} /></div>
-          <div><strong>CliniScribe</strong><span>AI CLINICAL ASSISTANT</span></div>
+          <div><strong>VOXMED AI</strong><span>AI CLINICAL ASSISTANT</span></div>
         </div>
 
         <div className="workspace-label">WORKSPACE</div>
@@ -131,15 +216,39 @@ export default function App() {
               <div className={`recording-visual ${recording && !paused ? 'is-recording' : ''}`}><div className="wave-icon"><Waves size={26} /></div><div><strong>{finished ? 'Session completed' : recording ? paused ? 'Recording paused' : 'Listening to consultation' : 'Ready to begin'}</strong><span>{finished ? 'This session is closed. Start a new session to record again.' : recording ? paused ? 'Continue when ready' : 'Audio capture is not connected yet' : 'Start a session when the patient is ready.'}</span></div><div className="wave-bars">{Array.from({ length: 20 }, (_, i) => <i key={i} style={{height: `${8 + ((i * 13 + 7) % 24)}px`}} />)}</div></div>
               <div className="record-controls">
                 {!recording && !finished && <button className="primary-button record-start" onClick={startRecording}><Mic size={17} /> Start recording</button>}
-                {recording && !paused && <button className="secondary-button" onClick={() => setPaused(true)}><Pause size={16} /> Pause</button>}
-                {recording && paused && <button className="primary-button" onClick={() => setPaused(false)}><Play size={16} /> Continue</button>}
+                {recording && !paused && <button className="secondary-button" onClick={togglePause}><Pause size={16} /> Pause</button>}
+                {recording && paused && <button className="primary-button" onClick={togglePause}><Play size={16} /> Continue</button>}
                 {recording && <button className="danger-button" onClick={finishRecording}><Square size={14} /> Finish visit</button>}
                 {finished && <button className="primary-button" onClick={startRecording}><Mic size={17} /> New recording session</button>}
                 {!recording && !finished && <span className="consent-note">Confirm patient consent before recording.</span>}
               </div>
+              {recordingError && <p role="alert" className="disclaimer">{recordingError}</p>}
+              {audioUrl && (
+                <div className="panel" style={{ padding: 16, marginTop: 16 }}>
+                  <h3>Recorded consultation audio</h3>
+                  <audio controls src={audioUrl} style={{ width: '100%' }} />
+                  <p className="disclaimer">
+                    Temporary local recording. It has not been uploaded to a server.
+                  </p>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      const link = document.createElement('a')
+                      link.href = audioUrl
+                      link.download = `cliniscribe-recording-${Date.now()}.webm`
+                      document.body.appendChild(link)
+                      link.click()
+                      link.remove()
+                    }}
+                  >
+                    Download Recording
+                  </button>
+                </div>
+              )}
               <div className="transcript-header"><h3><AudioLines size={17} /> Transcript</h3><span>{recording && !paused ? '● Demo session' : 'Draft'}</span></div>
-              <textarea className="transcript-area" value={transcript} onChange={e => setTranscript(e.target.value)} placeholder={recording ? 'Recording controls are a UI demo. Audio-to-text will be connected to the backend later.' : 'Transcript will appear here after speech recognition is connected. You can also type a demo transcript.'} />
-              <p className="disclaimer">Demo only: no microphone audio is being captured or transcribed.</p>
+              <textarea className="transcript-area" value={transcript} onChange={e => setTranscript(e.target.value)} placeholder={recording ? 'Audio is being recorded locally. Speech-to-text is not connected yet.' : 'Transcript will appear here after speech recognition is connected. You can also type a demo transcript.'} />
+              <p className="disclaimer">Local recording demo only: audio is captured in this browser but is not transcribed or uploaded.</p>
             </section>
           </div>
 
